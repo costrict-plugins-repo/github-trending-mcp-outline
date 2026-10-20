@@ -1,0 +1,362 @@
+"""
+Tests for the MCP Outline server.
+"""
+
+import os
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from mcp.server.fastmcp import FastMCP
+
+from mcp_outline.features import register_all
+from mcp_outline.features.dynamic_tools import (
+    build_role_blocked_map,
+    build_tool_endpoint_map,
+    install_dynamic_tool_list,
+)
+from tests.helpers import list_tools_via_handler
+
+
+@pytest.fixture
+def fresh_mcp_server():
+    """Create a fresh MCP server instance for testing."""
+    return FastMCP("Test Server")
+
+
+@pytest.mark.anyio
+async def test_server_initialization():
+    """Test that the server initializes correctly."""
+    from mcp_outline.server import mcp
+
+    assert mcp.name == "Document Outline"
+    assert len(await mcp.list_tools()) > 0  # Ensure functions are registered
+
+
+def test_instructions_mention_editing_by_default():
+    """Default instructions guide the LLM to edit tools."""
+    from mcp_outline.server import _build_instructions
+
+    text = _build_instructions(read_only=False)
+    assert "edit_document" in text
+    assert "update_document" in text
+    assert "get_document_toc" in text
+
+
+def test_instructions_omit_editing_in_read_only_mode():
+    """Read-only deployments must not advertise tools that
+    are not registered."""
+    from mcp_outline.server import _build_instructions
+
+    text = _build_instructions(read_only=True)
+    assert "edit_document" not in text
+    assert "update_document" not in text
+    assert "get_document_toc" in text
+
+
+def test_instructions_mention_recent_documents_by_default():
+    """Default instructions point the LLM at the recent-changes tool."""
+    from mcp_outline.server import _build_instructions
+
+    text = _build_instructions(read_only=False)
+    assert "list_recently_updated_documents" in text
+
+
+def test_instructions_omit_recent_documents_when_disabled():
+    """Disabling the recent-changes tool drops it from the guidance."""
+    from mcp_outline.server import _build_instructions
+
+    text = _build_instructions(read_only=False, recent_documents=False)
+    assert "list_recently_updated_documents" not in text
+    # Other finding-content tools are still advertised
+    assert "search_documents" in text
+
+
+@pytest.mark.anyio
+async def test_ai_tools_disabled_via_env_var(fresh_mcp_server):
+    """Test that AI tools are not registered when disabled via env var."""
+    with patch.dict(os.environ, {"OUTLINE_DISABLE_AI_TOOLS": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        assert "ask_ai_about_documents" not in tool_names
+        # Verify other tools are still registered
+        assert "search_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_ai_tools_enabled_by_default(fresh_mcp_server):
+    """Test that AI tools are registered when env var is not set."""
+    with patch.dict(os.environ, {}, clear=False):
+        # Ensure the env var is not set
+        os.environ.pop("OUTLINE_DISABLE_AI_TOOLS", None)
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        assert "ask_ai_about_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_read_only_mode_disables_write_tools(fresh_mcp_server):
+    """Test OUTLINE_READ_ONLY=true blocks write tools, allows read tools."""
+    with patch.dict(os.environ, {"OUTLINE_READ_ONLY": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        # Verify write tools are NOT registered
+        assert "create_document" not in tool_names
+        assert "update_document" not in tool_names
+        assert "archive_document" not in tool_names
+        assert "delete_document" not in tool_names
+        assert "move_document" not in tool_names
+        assert "batch_archive_documents" not in tool_names
+
+        # Verify read tools ARE registered
+        assert "search_documents" in tool_names
+        assert "read_document" in tool_names
+        assert "list_document_comments" in tool_names
+        assert "export_collection" in tool_names
+        assert "ask_ai_about_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_read_only_mode_blocks_destructive_tools(fresh_mcp_server):
+    """Test create/update collection tools blocked in read-only mode."""
+    with patch.dict(os.environ, {"OUTLINE_READ_ONLY": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        # Verify write/destructive collection tools are NOT registered
+        assert "create_collection" not in tool_names
+        assert "update_collection" not in tool_names
+        assert "delete_collection" not in tool_names
+
+        # Verify export collection tools ARE registered
+        assert "export_collection" in tool_names
+        assert "export_all_collections" in tool_names
+
+
+@pytest.mark.anyio
+async def test_disable_delete_blocks_deletes_only(fresh_mcp_server):
+    """Test OUTLINE_DISABLE_DELETE=true blocks only delete ops."""
+    with patch.dict(os.environ, {"OUTLINE_DISABLE_DELETE": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        # Verify delete tools are NOT registered
+        assert "delete_document" not in tool_names
+        assert "delete_collection" not in tool_names
+
+        # Verify other write tools ARE registered
+        assert "create_document" in tool_names
+        assert "update_document" in tool_names
+        assert "archive_document" in tool_names
+        assert "create_collection" in tool_names
+        assert "update_collection" in tool_names
+
+
+@pytest.mark.anyio
+async def test_disable_recent_documents_blocks_only_that_tool(
+    fresh_mcp_server,
+):
+    """OUTLINE_DISABLE_RECENT_DOCUMENTS hides only the recent-changes tool."""
+    with patch.dict(os.environ, {"OUTLINE_DISABLE_RECENT_DOCUMENTS": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        # The recent-changes tool is NOT registered
+        assert "list_recently_updated_documents" not in tool_names
+
+        # Other read tools in the same module ARE still registered
+        assert "search_documents" in tool_names
+        assert "list_collections" in tool_names
+
+
+@pytest.mark.anyio
+async def test_recent_documents_tool_registered_by_default(fresh_mcp_server):
+    """The recent-changes tool is registered when the flag is unset."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("OUTLINE_DISABLE_RECENT_DOCUMENTS", None)
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        assert "list_recently_updated_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_both_flags_together(fresh_mcp_server):
+    """Test that OUTLINE_READ_ONLY takes precedence when both are set."""
+    with patch.dict(
+        os.environ,
+        {"OUTLINE_READ_ONLY": "true", "OUTLINE_DISABLE_DELETE": "true"},
+    ):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        # Should behave like read-only mode (same as test 1)
+        # Verify write tools are NOT registered
+        assert "create_document" not in tool_names
+        assert "update_document" not in tool_names
+        assert "archive_document" not in tool_names
+        assert "delete_document" not in tool_names
+        assert "move_document" not in tool_names
+        assert "batch_archive_documents" not in tool_names
+
+        # Verify read tools ARE registered
+        assert "search_documents" in tool_names
+        assert "read_document" in tool_names
+        assert "list_document_comments" in tool_names
+        assert "export_collection" in tool_names
+        assert "ask_ai_about_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_ai_tools_work_with_read_only(fresh_mcp_server):
+    """Test that AI tools work in read-only mode unless separately disabled."""
+    # Test 1: AI tools work with read-only mode
+    with patch.dict(os.environ, {"OUTLINE_READ_ONLY": "true"}):
+        register_all(fresh_mcp_server)
+        tools = await fresh_mcp_server.list_tools()
+        tool_names = [tool.name for tool in tools]
+
+        assert "ask_ai_about_documents" in tool_names
+
+    # Test 2: AI tools disabled when both flags are set
+    fresh_mcp_server2 = FastMCP("Test Server 2")
+    with patch.dict(
+        os.environ,
+        {"OUTLINE_READ_ONLY": "true", "OUTLINE_DISABLE_AI_TOOLS": "true"},
+    ):
+        register_all(fresh_mcp_server2)
+        tools2 = await fresh_mcp_server2.list_tools()
+        tool_names2 = [tool.name for tool in tools2]
+
+        assert "ask_ai_about_documents" not in tool_names2
+
+
+@pytest.mark.anyio
+async def test_dynamic_tool_list_when_enabled(
+    fresh_mcp_server,
+):
+    """Dynamic tool list should filter via the MCP protocol handler.
+
+    Uses the lowlevel handler path to match real MCP clients.
+    """
+    with patch.dict(
+        os.environ,
+        {"OUTLINE_DYNAMIC_TOOL_LIST": "true"},
+    ):
+        register_all(fresh_mcp_server)
+        install_dynamic_tool_list(
+            fresh_mcp_server,
+            build_tool_endpoint_map(fresh_mcp_server),
+            build_role_blocked_map(fresh_mcp_server),
+        )
+
+        # Admin still sees all tools via protocol handler
+        with patch(
+            "mcp_outline.features.dynamic_tools.filtering.get_blocked_tools",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ):
+            tools = await list_tools_via_handler(fresh_mcp_server)
+            tool_names = [tool.name for tool in tools]
+
+            assert "create_document" in tool_names
+            assert "search_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_dynamic_tool_list_composes_with_read_only():
+    """Dynamic + read-only should compose: write tools absent.
+
+    Uses the lowlevel handler path to match real MCP clients.
+    """
+    mcp = FastMCP("Test Compose")
+    with patch.dict(
+        os.environ,
+        {
+            "OUTLINE_READ_ONLY": "true",
+            "OUTLINE_DYNAMIC_TOOL_LIST": "true",
+        },
+    ):
+        register_all(mcp)
+        install_dynamic_tool_list(
+            mcp,
+            build_tool_endpoint_map(mcp),
+            build_role_blocked_map(mcp),
+        )
+
+        # Even with admin role, read-only registration
+        # already removed write tools.
+        with patch(
+            "mcp_outline.features.dynamic_tools.filtering.get_blocked_tools",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ):
+            tools = await list_tools_via_handler(mcp)
+            tool_names = [tool.name for tool in tools]
+
+            assert "create_document" not in tool_names
+            assert "search_documents" in tool_names
+
+
+@pytest.mark.anyio
+async def test_disable_delete_composes_with_dynamic_tool_list():
+    """OUTLINE_DISABLE_DELETE + dynamic tool list should compose.
+
+    Delete tools are absent at registration.  The dynamic filter
+    should still work for remaining write tools without errors.
+
+    Uses the lowlevel handler path to match real MCP clients.
+    """
+    mcp = FastMCP("Test Compose Delete")
+    with patch.dict(
+        os.environ,
+        {
+            "OUTLINE_DISABLE_DELETE": "true",
+            "OUTLINE_DYNAMIC_TOOL_LIST": "true",
+        },
+    ):
+        register_all(mcp)
+        install_dynamic_tool_list(
+            mcp,
+            build_tool_endpoint_map(mcp),
+            build_role_blocked_map(mcp),
+        )
+
+        # Admin sees everything except delete tools
+        with patch(
+            "mcp_outline.features.dynamic_tools.filtering.get_blocked_tools",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ):
+            tools = await list_tools_via_handler(mcp)
+            names = [t.name for t in tools]
+
+            assert "delete_document" not in names
+            assert "delete_collection" not in names
+            # Other write tools still present for admin
+            assert "create_document" in names
+            assert "update_document" in names
+
+        # Viewer sees no member/admin tools at all
+        role_map = build_role_blocked_map(mcp)
+        with patch(
+            "mcp_outline.features.dynamic_tools.filtering.get_blocked_tools",
+            new_callable=AsyncMock,
+            return_value=set(role_map["viewer"]),
+        ):
+            tools = await list_tools_via_handler(mcp)
+            names = [t.name for t in tools]
+
+            assert "delete_document" not in names
+            assert "create_document" not in names
+            assert "search_documents" in names
